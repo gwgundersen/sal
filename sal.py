@@ -17,7 +17,9 @@ import json
 import os
 import shutil
 import sys
+from itertools import islice
 from pathlib import Path
+from typing import Iterator
 
 import anthropic
 
@@ -48,96 +50,86 @@ def _index_dir() -> Path:
 
 def _read_file(path: Path) -> str:
     if path.suffix.lower() == ".pdf":
-        if HAS_PDF:
-            doc = fitz.open(str(path))
-            return "\n\n".join(page.get_text() for page in doc)
-        return "[PDF support unavailable — install PyMuPDF: pip install pymupdf]"
+        if not HAS_PDF:
+            return "[PDF support unavailable — install PyMuPDF: pip install pymupdf]"
+        doc = fitz.open(str(path))
+        return "\n\n".join(page.get_text() for page in doc)
     return path.read_text(errors="replace")
+
+def _resource_files(*dirs: Path) -> Iterator[Path]:
+    for d in dirs:
+        if d.exists():
+            yield from (f for ext in RESOURCE_EXTS for f in sorted(d.rglob(f"*{ext}")))
 
 
 # ── Math rendering ────────────────────────────────────────────────────────────
 
+def _convert_math(latex: str, display: bool) -> str:
+    if HAS_LATEX:
+        try:
+            text = _l2t.latex_to_text(latex).strip()
+        except Exception:
+            text = latex
+    else:
+        text = latex
+    return f"\n\n  {text}\n\n" if display else text
+
+
 class MathRenderer:
     """Convert LaTeX math to unicode on-the-fly during streaming.
 
-    Prose is passed through immediately. When a $ or $$ delimiter is seen,
-    content is buffered until the closing delimiter, then converted and flushed.
-    Handles chunk boundaries safely via a one-char lookahead buffer.
+    Prose passes through immediately. Math content is buffered until the
+    closing delimiter, then converted and flushed. Handles chunk boundaries
+    via a one-char carry buffer.
     """
 
     def __init__(self):
-        self._pending = ""   # at most one "$" carried across chunk boundary
+        self._buf = ""       # at most one "$" carried across chunk boundary
         self._math = ""      # accumulated math content
         self._in_math = False
         self._display = False
 
     def feed(self, chunk: str) -> str:
         out = []
-        text = self._pending + chunk
-        self._pending = ""
+        text = self._buf + chunk
+        self._buf = ""
         i = 0
         while i < len(text):
             ch = text[i]
             if not self._in_math:
-                if ch == "$":
-                    if i + 1 >= len(text):
-                        self._pending = "$"   # wait for next chunk
-                        break
-                    if text[i + 1] == "$":
-                        self._in_math = True
-                        self._display = True
-                        self._math = ""
-                        i += 2
-                    else:
-                        self._in_math = True
-                        self._display = False
-                        self._math = ""
-                        i += 1
-                else:
-                    out.append(ch)
-                    i += 1
+                if ch != "$":
+                    out.append(ch); i += 1; continue
+                if i + 1 >= len(text):
+                    self._buf = "$"; break
+                self._display = text[i + 1] == "$"
+                self._in_math = True
+                self._math = ""
+                i += 2 if self._display else 1
             else:
-                if ch == "$":
-                    if self._display:
-                        if i + 1 >= len(text):
-                            self._pending = "$"
-                            break
-                        if text[i + 1] == "$":
-                            out.append(self._convert(self._math, display=True))
-                            self._in_math = False
-                            i += 2
-                        else:
-                            self._math += ch
-                            i += 1
+                if ch != "$":
+                    self._math += ch; i += 1; continue
+                if self._display:
+                    if i + 1 >= len(text):
+                        self._buf = "$"; break
+                    if text[i + 1] == "$":
+                        out.append(_convert_math(self._math, display=True))
+                        self._in_math = False; i += 2
                     else:
-                        out.append(self._convert(self._math, display=False))
-                        self._in_math = False
-                        i += 1
+                        self._math += ch; i += 1
                 else:
-                    self._math += ch
-                    i += 1
+                    out.append(_convert_math(self._math, display=False))
+                    self._in_math = False; i += 1
         return "".join(out)
 
     def flush(self) -> str:
-        """Emit any buffered content at end of response."""
         if self._in_math:
             delim = "$$" if self._display else "$"
-            result = delim + self._math + self._pending + delim
+            result = delim + self._math + self._buf + delim
         else:
-            result = self._pending
-        self._pending = self._math = ""
+            result = self._buf
+        self._buf = self._math = ""
         self._in_math = self._display = False
         return result
-
-    def _convert(self, latex: str, display: bool) -> str:
-        if HAS_LATEX:
-            try:
-                text = _l2t.latex_to_text(latex).strip()
-            except Exception:
-                text = latex
-        else:
-            text = latex
-        return f"\n\n  {text}\n\n" if display else text
 
 
 # ── Indexing ──────────────────────────────────────────────────────────────────
@@ -168,10 +160,17 @@ def _is_stale(resource: Path, card: Path) -> bool:
     if not card.exists():
         return True
     try:
-        cached = json.loads(card.read_text())
-        return resource.stat().st_mtime > cached.get("_mtime", 0)
+        return resource.stat().st_mtime > json.loads(card.read_text()).get("_mtime", 0)
     except Exception:
         return True
+
+
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        _, _, text = text.partition("\n")
+        text = text.rstrip("`").strip()
+    return text
 
 
 def _index_one(resource: Path, client: anthropic.Anthropic) -> dict:
@@ -186,14 +185,7 @@ def _index_one(resource: Path, client: anthropic.Anthropic) -> dict:
         messages=[{"role": "user", "content": f"Document path: {resource.name}\n\n{content}"}],
     )
 
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-
-    card = json.loads(text)
+    card = json.loads(_strip_json_fences(response.content[0].text))
     card["path"] = str(resource.relative_to(ws()))
     card["_mtime"] = resource.stat().st_mtime
     return card
@@ -206,13 +198,8 @@ def ensure_indexed(client: anthropic.Anthropic) -> list[dict]:
         return []
 
     _index_dir().mkdir(parents=True, exist_ok=True)
-
-    files = sorted(
-        f for ext in RESOURCE_EXTS for f in resources_dir.rglob(f"*{ext}")
-    )
-
     cards = []
-    for f in files:
+    for f in _resource_files(resources_dir):
         card_path = _card_path(f)
         if _is_stale(f, card_path):
             print(f"  · indexing {f.name} …", end="", flush=True)
@@ -233,15 +220,7 @@ def ensure_indexed(client: anthropic.Anthropic) -> list[dict]:
 # ── Tool implementations ──────────────────────────────────────────────────────
 
 def list_documents() -> dict:
-    resources_dir = ws() / "resources"
-    if not resources_dir.exists():
-        return {"documents": []}
-    docs = sorted(
-        str(f.relative_to(ws()))
-        for ext in RESOURCE_EXTS
-        for f in resources_dir.rglob(f"*{ext}")
-    )
-    return {"documents": docs}
+    return {"documents": [str(f.relative_to(ws())) for f in _resource_files(ws() / "resources")]}
 
 
 def read_document(path: str, page: int = None) -> dict:
@@ -260,32 +239,19 @@ def read_document(path: str, page: int = None) -> dict:
     return {"path": path, "content": content}
 
 
+def _matching_lines(f: Path, q: str) -> Iterator[dict]:
+    try:
+        for i, line in enumerate(_read_file(f).splitlines(), 1):
+            if q in line.lower():
+                yield {"path": str(f.relative_to(ws())), "line": i, "text": line.strip()}
+    except Exception:
+        return
+
+
 def search(query: str, max_results: int = 5) -> dict:
-    q = query.lower()
-    results, count = [], 0
-    search_dirs = [ws() / "resources", ws() / "notes"]
-    for d in search_dirs:
-        if not d.exists() or count >= max_results:
-            continue
-        for ext in RESOURCE_EXTS:
-            for f in d.rglob(f"*{ext}"):
-                if count >= max_results:
-                    break
-                try:
-                    text = _read_file(f)
-                except Exception:
-                    continue
-                for i, line in enumerate(text.splitlines(), 1):
-                    if q in line.lower():
-                        results.append({
-                            "path": str(f.relative_to(ws())),
-                            "line": i,
-                            "text": line.strip(),
-                        })
-                        count += 1
-                        if count >= max_results:
-                            break
-    return {"query": query, "results": results}
+    hits = (hit for f in _resource_files(ws() / "resources", ws() / "notes")
+                for hit in _matching_lines(f, query.lower()))
+    return {"query": query, "results": list(islice(hits, max_results))}
 
 
 def write_note(path: str, content: str) -> dict:
@@ -311,11 +277,11 @@ def list_notes() -> dict:
 
 DISPATCH = {
     "list_documents": list_documents,
-    "read_document": read_document,
-    "search": search,
-    "write_note": write_note,
-    "read_note": read_note,
-    "list_notes": list_notes,
+    "read_document":  read_document,
+    "search":         search,
+    "write_note":     write_note,
+    "read_note":      read_note,
+    "list_notes":     list_notes,
 }
 
 
@@ -413,12 +379,13 @@ def build_system_prompt(cards: list[dict]) -> str:
                 ))
             lines.append("")
 
-    sal_md = root / "SAL.md"
-    if sal_md.exists():
-        lines += ["## Tutor instructions (SAL.md)", sal_md.read_text(), ""]
-    learner_md = root / "LEARNER.md"
-    if learner_md.exists():
-        lines += ["## Learner profile (LEARNER.md)", learner_md.read_text(), ""]
+    for fname, heading in [
+        ("SAL.md",     "## Tutor instructions (SAL.md)"),
+        ("LEARNER.md", "## Learner profile (LEARNER.md)"),
+    ]:
+        p = root / fname
+        if p.exists():
+            lines += [heading, p.read_text(), ""]
 
     return "\n".join(lines)
 
@@ -426,15 +393,12 @@ def build_system_prompt(cards: list[dict]) -> str:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def get_api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
+    if key := os.environ.get("ANTHROPIC_API_KEY"):
         return key
     config_path = ws() / ".sal" / "config.json"
     if config_path.exists():
         try:
-            cfg = json.loads(config_path.read_text())
-            key = cfg.get("api_key", "")
-            if key:
+            if key := json.loads(config_path.read_text()).get("api_key"):
                 return key
         except Exception:
             pass
@@ -445,21 +409,16 @@ def get_api_key() -> str:
 
 
 def _format_tool(name: str, inputs: dict) -> str:
-    if name == "read_document":
-        filename = Path(inputs.get("path", "")).name
-        page = inputs.get("page")
-        return f"Read({filename}{f' p{page}' if page is not None else ''})"
-    if name == "search":
-        return f"Search({inputs.get('query', '')!r})"
-    if name == "write_note":
-        return f"Write({inputs.get('path', '')})"
-    if name == "read_note":
-        return f"Read(notes/{inputs.get('path', '')})"
-    if name == "list_documents":
-        return "List(resources)"
-    if name == "list_notes":
-        return "List(notes)"
-    return name
+    match name:
+        case "read_document":
+            p, pg = Path(inputs.get("path", "")).name, inputs.get("page")
+            return f"Read({p}{f' p{pg}' if pg is not None else ''})"
+        case "search":         return f"Search({inputs.get('query', '')!r})"
+        case "write_note":     return f"Write({inputs.get('path', '')})"
+        case "read_note":      return f"Read(notes/{inputs.get('path', '')})"
+        case "list_documents": return "List(resources)"
+        case "list_notes":     return "List(notes)"
+        case _:                return name
 
 
 def _w() -> int:
@@ -467,8 +426,7 @@ def _w() -> int:
 
 
 def _prompt() -> str:
-    w = _w()
-    bar = "─" * (w - 2)
+    bar = "─" * (_w() - 2)
     print(f"╭{bar}╮")
     try:
         text = input("│ > ")
@@ -479,9 +437,45 @@ def _prompt() -> str:
     return text.strip()
 
 
+def _run_turn(client: anthropic.Anthropic, system: str, messages: list) -> None:
+    """Run one complete agent turn, including any tool-use rounds."""
+    while True:
+        renderer = MathRenderer()
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=4096,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
+        ) as stream:
+            first_text = True
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "text":
+                    if first_text:
+                        print("\n  ◆ ", end="", flush=True)
+                        first_text = False
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    print(renderer.feed(event.delta.text), end="", flush=True)
+            print(renderer.flush(), end="", flush=True)
+            response = stream.get_final_message()
+
+        print("\n")
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+        if response.stop_reason == "end_turn" or not tool_uses:
+            break
+
+        for tu in tool_uses:
+            print(f"  · {_format_tool(tu.name, tu.input)}", flush=True)
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tu.id, "content": run_tool(tu.name, tu.input)}
+            for tu in tool_uses
+        ]})
+
+
 def main():
     client = anthropic.Anthropic(api_key=get_api_key())
-
     print(f"\n  ◆ sal  ·  {ws()}\n")
 
     sal_md = ws() / "SAL.md"
@@ -507,50 +501,7 @@ def main():
             break
 
         messages.append({"role": "user", "content": user_input})
-
-        while True:
-            renderer = MathRenderer()
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=4096,
-                system=system,
-                tools=TOOLS,
-                messages=messages,
-            ) as stream:
-                first_text = True
-                current_block_type = None
-                for event in stream:
-                    if event.type == "content_block_start":
-                        current_block_type = event.content_block.type
-                        if current_block_type == "text" and first_text:
-                            print("\n  ◆ ", end="", flush=True)
-                            first_text = False
-                    elif event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            print(renderer.feed(event.delta.text), end="", flush=True)
-                print(renderer.flush(), end="", flush=True)
-                response = stream.get_final_message()
-
-            print("\n")
-
-            messages.append({"role": "assistant", "content": response.content})
-
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if response.stop_reason == "end_turn" or not tool_uses:
-                break
-
-            tool_results = []
-            for tu in tool_uses:
-                print(f"  · {_format_tool(tu.name, tu.input)}", flush=True)
-                result = run_tool(tu.name, tu.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tu.id,
-                    "content": result,
-                })
-
-            messages.append({"role": "user", "content": tool_results})
-
+        _run_turn(client, system, messages)
         print()
 
 
