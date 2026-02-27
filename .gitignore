@@ -1,2 +1,19 @@
 PLAN.md
 .*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# uv
+uv.lock
+
+# sal index (per-project, not part of source)
+.sal/
+
+# editors
+*#
