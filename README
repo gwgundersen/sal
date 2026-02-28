@@ -1,0 +1,69 @@
+        Sal - a document knowledge base
+
+Sal indexes a directory of documents (PDF, Markdown, plain text, HTML,
+Org) using Claude to extract structured metadata — title, topics, summary,
+sections, key terms, prerequisites, and key results — into JSON cards.
+It stores full text in an FTS5 search index for fast retrieval.
+
+Sal can be used three ways: as a CLI, as a web UI, or as an MCP server
+that gives Claude access to your documents.
+
+
+REQUIREMENTS
+
+  - Python 3.11+
+  - An Anthropic API key (export ANTHROPIC_API_KEY=...)
+
+
+INSTALLING
+
+  pip install -e .
+
+Or with uv:
+
+  uv pip install -e .
+
+
+USAGE
+
+Index the current directory:
+
+  sal init
+
+This reads every supported file, sends it to Claude for metadata
+extraction, and writes a JSON card per document under .sal/index/.
+It also populates an FTS5 database at .sal/search.db.
+
+List indexed documents:
+
+  sal ls
+
+Start the web UI:
+
+  sal serve              # http://localhost:8888
+  sal serve --port 3000
+
+The web UI shows all indexed documents, their metadata cards, and
+provides full-text search.
+
+Run as an MCP server (for use with Claude Code, Claude Desktop, etc.):
+
+  sal --resources /path/to/docs
+
+This exposes three MCP tools: List, Read, and Search.
+
+
+SUPPORTED FILE TYPES
+
+  .pdf  .md  .txt  .html  .org
+
+
+PROJECT LAYOUT
+
+  sal/
+    __init__.py     Entry point
+    cli.py          CLI commands (init, ls, serve)
+    core.py         Indexing, FTS, document reading
+    web.py          Flask web UI
+    mcp.py          MCP server and tools
+    templates/      Jinja2 templates for web UI
