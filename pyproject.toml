@@ -2,13 +2,13 @@
 name = "sal"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["anthropic", "pymupdf", "mcp"]
+dependencies = ["anthropic", "pymupdf", "mcp", "flask"]
 
 [project.scripts]
 sal = "sal:main"
 
 [tool.setuptools]
-py-modules = ["sal"]
+packages = ["sal"]
 
 [dependency-groups]
 dev = ["pytest"]
