@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}sal — documents{% endblock %}
+{% block body %}
+<h1>{{ cards|length }} document{{ 's' if cards|length != 1 else '' }}</h1>
+{% for c in cards %}
+<div class="card">
+  <h2><a href="/card/{{ c.path }}">{{ c.title or c.path }}</a></h2>
+  {% if c.summary %}<div class="summary">{{ c.summary }}</div>{% endif %}
+  {% if c.topics %}
+  <div class="topics">{% for t in c.topics %}<span>{{ t }}</span>{% endfor %}</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

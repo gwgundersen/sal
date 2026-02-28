@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ card.title or card.path }} — sal{% endblock %}
+{% block body %}
+<a class="back" href="/">&larr; All documents</a>
+<h1>{{ card.title or card.path }}</h1>
+<div class="meta" style="margin-bottom:1rem;">Edit this card: <code>{{ card_file }}</code></div>
+<div class="content">{{ card_json }}</div>
+{% endblock %}

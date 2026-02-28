@@ -10,5 +10,8 @@ sal = "sal:main"
 [tool.setuptools]
 packages = ["sal"]
 
+[tool.setuptools.package-data]
+sal = ["templates/*.html"]
+
 [dependency-groups]
 dev = ["pytest"]
